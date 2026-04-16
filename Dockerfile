@@ -9,8 +9,6 @@ RUN npm install
 
 COPY . .
 
-VOLUME ["/app/data"]
-
 EXPOSE 3000
 
 CMD ["npm", "start"]
