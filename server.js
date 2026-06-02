@@ -17,9 +17,15 @@ db.exec(`
     status TEXT DEFAULT 'pending',
     added_at INTEGER,
     last_check INTEGER,
-    error TEXT
+    error TEXT,
+    direct_url TEXT,
+    used_host TEXT
   )
 `);
+
+// migrate: add new columns if upgrading from old DB
+try { db.exec("ALTER TABLE links ADD COLUMN direct_url TEXT"); } catch {}
+try { db.exec("ALTER TABLE links ADD COLUMN used_host TEXT"); } catch {}
 
 // ============ DB HELPERS ============
 function getAllLinks() {
@@ -32,12 +38,14 @@ function getLink(url) {
 
 function upsertLink(data) {
   const stmt = db.prepare(`
-    INSERT INTO links (url, status, added_at, last_check, error)
-    VALUES (@url, @status, @added_at, @last_check, @error)
+    INSERT INTO links (url, status, added_at, last_check, error, direct_url, used_host)
+    VALUES (@url, @status, @added_at, @last_check, @error, @direct_url, @used_host)
     ON CONFLICT(url) DO UPDATE SET
       status = @status,
       last_check = @last_check,
-      error = @error
+      error = @error,
+      direct_url = @direct_url,
+      used_host = @used_host
   `);
   stmt.run({
     url: data.url,
@@ -45,6 +53,8 @@ function upsertLink(data) {
     added_at: data.added_at || Date.now(),
     last_check: data.last_check || null,
     error: data.error || null,
+    direct_url: data.direct_url || null,
+    used_host: data.used_host || null,
   });
 }
 
@@ -105,18 +115,20 @@ app.get("/", (c) => {
                         <thead class="bg-slate-900 text-slate-500 sticky top-0">
                             <tr>
                                 <th class="p-4">Link URL</th>
+                                <th class="p-4">Host Used</th>
                                 <th class="p-4">Last Checked (MMT)</th>
                                 <th class="p-4">Status</th>
                                 <th class="p-4 text-right">Action</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-700">
-                            ${links.length === 0 ? '<tr><td colspan="4" class="p-8 text-center text-slate-500">Empty List</td></tr>' : ""}
+                            ${links.length === 0 ? '<tr><td colspan="5" class="p-8 text-center text-slate-500">Empty List</td></tr>' : ""}
                             ${links
                               .map(
                                 (l) => `
                                 <tr class="hover:bg-slate-700/30 transition">
-                                    <td class="p-4 text-blue-300 font-mono truncate max-w-[300px]" title="${l.url}">${l.url}</td>
+                                    <td class="p-4 text-blue-300 font-mono truncate max-w-[260px]" title="${l.url}">${l.url}</td>
+                                    <td class="p-4 text-slate-400 font-mono">${l.used_host || "-"}</td>
                                     <td class="p-4 text-slate-400">
                                         ${l.last_check ? new Date(l.last_check).toLocaleString("en-US", { timeZone: "Asia/Yangon" }) : "Pending..."}
                                     </td>
@@ -212,10 +224,11 @@ async function runMaintenance() {
         const MAX_RETRIES = 3;
         let success = false;
         let lastError = null;
+        let result = null;
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
-            await processQyShare(linkData.url);
+            result = await processQyShare(linkData.url);
             success = true;
             break;
           } catch (e) {
@@ -235,6 +248,8 @@ async function runMaintenance() {
             status: "active",
             last_check: Date.now(),
             error: null,
+            direct_url: result.directUrl,
+            used_host: result.usedHost,
           });
         } else {
           console.error(`FAILED ${linkData.url}: ${lastError}`);
@@ -252,51 +267,140 @@ async function runMaintenance() {
   }
 }
 
+// ---------- helpers for host testing ----------
+const COMMON_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+};
+
+// host string like "d6.qyshare.store" or "d6.qyshare.store:2083"
+function hostProtocol(host) {
+  const bare = host.split(":")[0];
+  const isIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(bare);
+  return isIp ? "http" : "https";
+}
+
+// Test a single host by hitting /ping (mirrors the site's findAvailableHost logic)
+async function testHost(host) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), 6000);
+  try {
+    const url = `${hostProtocol(host)}://${host}/ping?ts=${Date.now()}`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: COMMON_HEADERS,
+      signal: controller.signal,
+    });
+    // any reachable response (even 404) means the host server is alive
+    return res.status > 0;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// Find the first available host id from a list
+async function findAvailableHost(hosts) {
+  for (const h of hosts) {
+    if (await testHost(h.host)) {
+      return h;
+    }
+  }
+  return null;
+}
+
 async function processQyShare(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 30000);
 
   try {
     const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
-      },
+      headers: COMMON_HEADERS,
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const html = await res.text();
-    const token = html.match(/const token = "([^"]+)";/)?.[1];
-    const fileId = html.match(/const fileId = (\d+);/)?.[1];
-    const hostsMatch = html.match(/const downloadHosts = (\[.*?\]);/s);
 
-    if (!token || !fileId || !hostsMatch) throw new Error("Invalid Page Structure");
+    // --- Parse page variables (tolerant of spacing and escaped slashes) ---
+    const token =
+      html.match(/const\s+token\s*=\s*"([^"]+)"/)?.[1];
+    const fileId =
+      html.match(/const\s+fileId\s*=\s*(\d+)/)?.[1];
+    const hostsMatch = html.match(
+      /const\s+downloadHosts\s*=\s*(\[[\s\S]*?\]);/
+    );
+    const backupHostsMatch = html.match(
+      /const\s+backupDownloadHosts\s*=\s*(\[[\s\S]*?\]);/
+    );
 
-    const hosts = JSON.parse(hostsMatch[1]);
-    if (hosts.length === 0) throw new Error("No Hosts Available");
+    if (!token || !fileId) throw new Error("Invalid Page Structure (token/fileId missing)");
+    if (!hostsMatch) throw new Error("downloadHosts not found");
+
+    // If the page asks for a password, file still exists but we can't fetch directly
+    const hasPassword = /const\s+hasPassword\s*=\s*true/.test(html);
+
+    const downloadHosts = JSON.parse(hostsMatch[1]).filter(
+      (h) => h.status === 1
+    );
+    const backupHosts = backupHostsMatch
+      ? JSON.parse(backupHostsMatch[1]).filter((h) => h.status === 1)
+      : [];
+
+    if (downloadHosts.length === 0 && backupHosts.length === 0)
+      throw new Error("No Hosts Available");
+
+    // --- Try to find ANY working host (primary first, then backup) ---
+    let chosen = await findAvailableHost(downloadHosts);
+    if (!chosen) chosen = await findAvailableHost(backupHosts);
+
+    // Fallback: if no /ping responded, just take the first listed host
+    // (the file may still exist; ping endpoint can be blocked/CORS-only)
+    if (!chosen) {
+      chosen =
+        downloadHosts[0] || backupHosts[0] || null;
+      if (!chosen) throw new Error("No usable host");
+    }
 
     const parsedUrl = new URL(url);
-    const apiUrl = `${parsedUrl.origin}/api/share/download?token=${encodeURIComponent(token)}&fileId=${encodeURIComponent(fileId)}&hostId=${hosts[0].id}`;
+    const apiUrl = `${parsedUrl.origin}/api/share/download?token=${encodeURIComponent(
+      token
+    )}&fileId=${encodeURIComponent(fileId)}&hostId=${encodeURIComponent(
+      chosen.id
+    )}`;
 
+    // --- Hit the download API to actually "touch" the file and resolve the direct link ---
     const apiRes = await fetch(apiUrl, {
       method: "GET",
-      headers: { "User-Agent": "Mozilla/5.0", Referer: url },
+      headers: { ...COMMON_HEADERS, Referer: url },
       redirect: "follow",
       signal: controller.signal,
     });
-    if (!apiRes.ok) throw new Error("API Connection Failed");
+    if (!apiRes.ok && apiRes.status !== 206)
+      throw new Error(`Download API failed: HTTP ${apiRes.status}`);
 
-    // Consume and discard the body
+    // apiRes.url holds the final redirected (direct) URL after following redirects
+    const directUrl = apiRes.url || apiUrl;
+
+    // Stream a little bit then abort to keep the file "warm" without downloading 1GB
     const reader = apiRes.body?.getReader();
     if (reader) {
-      while (true) {
-        const { done } = await reader.read();
+      let pulled = 0;
+      while (pulled < 64 * 1024) {
+        // pull ~64KB max then stop
+        const { done, value } = await reader.read();
         if (done) break;
+        pulled += value?.length || 0;
       }
+      try { await reader.cancel(); } catch {}
     }
 
-    return true;
+    return {
+      directUrl,
+      usedHost: chosen.host,
+      hasPassword,
+    };
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error("Timeout (Web too slow)");
